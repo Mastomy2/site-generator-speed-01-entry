@@ -362,8 +362,9 @@ function hasWS(s) {
 // Inline rendering, exactly the reference's rules, driven by indexOf jumps
 // between interesting characters instead of a per-character loop. Plain runs
 // between specials hold no escapable character and are copied verbatim.
-function inline(s, env) {
-  const out = [];
+// Appends into the caller's `out` array (nested emphasis/links append into
+// the same array instead of building and joining a string per nesting level).
+function inline(s, env, out) {
   let i = 0;
   const len = s.length;
   while (i < len) {
@@ -404,7 +405,7 @@ function inline(s, env) {
         const k = findUnescaped(s, '**', j + 2);
         if (k > j + 2) {
           out.push('<strong>');
-          out.push(inline(s.slice(j + 2, k), env));
+          inline(s.slice(j + 2, k), env, out);
           out.push('</strong>');
           i = k + 2;
         } else {
@@ -415,7 +416,7 @@ function inline(s, env) {
         const k = findSingleStar(s, j + 1);
         if (k > j + 1) {
           out.push('<em>');
-          out.push(inline(s.slice(j + 1, k), env));
+          inline(s.slice(j + 1, k), env, out);
           out.push('</em>');
           i = k + 1;
         } else {
@@ -433,7 +434,7 @@ function inline(s, env) {
       out.push('<a href="');
       escAppend(out, env.link(target));
       out.push('">');
-      out.push(inline(s.slice(j + 1, k), env));
+      inline(s.slice(j + 1, k), env, out);
       out.push('</a>');
       i = m + 1;
     } else {
@@ -441,6 +442,12 @@ function inline(s, env) {
       i = j + 1;
     }
   }
+}
+
+// Render inline markup to a string (one fresh array per top-level call).
+function inlineStr(s, env) {
+  const out = [];
+  inline(s, env, out);
   return out.join('');
 }
 
@@ -533,10 +540,54 @@ function splitLines(src) {
   return lines;
 }
 
+// Line kinds, classified once per renderMarkdown call so the block scan
+// does not re-run isBlank/fenceOpen/headingOf/isHR on every line it meets
+// (a paragraph line used to be scanned ~5 times: once in the main loop and
+// again by endsParagraph for every line after it). First-char dispatch only
+// ever skips a classifier that cannot match (each classifier needs its own
+// first character), so the kind is exactly the first match in main-loop
+// order: blank, fence, heading, HR, quote, bullet, ordered.
+const K_OTHER = 0;
+const K_BLANK = 1;
+const K_FENCE = 2; // bare ``` (opens with empty lang, or closes a fence)
+const K_FENCE_LANG = 3; // ```lang
+const K_HEADING = 4;
+const K_HR = 5;
+const K_QUOTE = 6;
+const K_BULLET = 7;
+const K_ORDERED = 8;
+
+function classifyLines(lines) {
+  const kinds = new Uint8Array(lines.length);
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.length === 0) { kinds[i] = K_BLANK; continue; }
+    const c = line.charCodeAt(0);
+    if (c === 32 || c === 9) { kinds[i] = isBlank(line) ? K_BLANK : K_OTHER; continue; }
+    if (c === 96) {
+      const lang = fenceOpen(line);
+      kinds[i] = lang === null ? K_OTHER : lang === '' ? K_FENCE : K_FENCE_LANG;
+      continue;
+    }
+    if (c === 35) { kinds[i] = headingOf(line) !== null ? K_HEADING : K_OTHER; continue; }
+    if (c === 45) { kinds[i] = isHR(line) ? K_HR : bulletMatch(line) !== null ? K_BULLET : K_OTHER; continue; }
+    if (c === 42) { kinds[i] = isHR(line) ? K_HR : bulletMatch(line) !== null ? K_BULLET : K_OTHER; continue; }
+    if (c >= 48 && c <= 57) { kinds[i] = orderedMatch(line) !== null ? K_ORDERED : K_OTHER; continue; }
+    if (c === 62) { kinds[i] = K_QUOTE; continue; }
+    kinds[i] = K_OTHER;
+  }
+  return kinds;
+}
+
+function endsKind(k) {
+  return k === K_BLANK || k === K_FENCE || k === K_FENCE_LANG || k === K_HEADING || k === K_HR;
+}
+
 // Fused lex+render: blocks are rendered as they are scanned, no token list.
 // env: { link(target)->href, slug(text)->slug }.
 function renderMarkdown(src, env) {
   const lines = splitLines(src);
+  const kinds = classifyLines(lines);
   const ids = new Set();
   const blocks = [];
   const toc = [];
@@ -545,51 +596,50 @@ function renderMarkdown(src, env) {
   const n = lines.length;
   while (i < n) {
     const line = lines[i];
-    if (isBlank(line)) { i++; continue; }
-    const fenceLang = fenceOpen(line);
-    if (fenceLang !== null) {
+    const kind = kinds[i];
+    if (kind === K_BLANK) { i++; continue; }
+    if (kind === K_FENCE || kind === K_FENCE_LANG) {
+      const fenceLang = fenceOpen(line);
       const body = [];
       i++;
-      while (i < n && !fenceClose(lines[i])) body.push(lines[i++]);
+      while (i < n && kinds[i] !== K_FENCE) body.push(lines[i++]);
       i++;
       const code = [];
       for (let k = 0; k < body.length; k++) { escAppend(code, body[k]); code.push('\n'); }
       blocks.push(`<pre><code${fenceLang === '' ? '' : ` class="language-${fenceLang}"`}>${code.join('')}</code></pre>`);
       continue;
     }
-    const heading = headingOf(line);
-    if (heading !== null) {
+    if (kind === K_HEADING) {
+      const heading = headingOf(line);
       const id = uniqueSlug(env.slug(heading.text), ids);
-      const html = inline(heading.text, env);
+      const html = inlineStr(heading.text, env);
       blocks.push(`<h${heading.depth} id="${id}">${html}</h${heading.depth}>`);
       if (heading.depth === 2 || heading.depth === 3) toc.push({ level: heading.depth, id, html });
       i++;
       continue;
     }
-    if (isHR(line)) { blocks.push('<hr>'); i++; continue; }
-    if (line.charCodeAt(0) === 62) { // '>'
+    if (kind === K_HR) { blocks.push('<hr>'); i++; continue; }
+    if (kind === K_QUOTE) {
       const body = [];
-      while (i < n && lines[i].charCodeAt(0) === 62) {
+      while (i < n && kinds[i] === K_QUOTE) {
         const l = lines[i++];
         body.push(trimLine(l[1] === ' ' ? l.slice(2) : l.slice(1)));
       }
       const kept = body.filter((l) => l !== '');
-      blocks.push(kept.length === 0 ? '<blockquote>\n</blockquote>' : `<blockquote>\n<p>${inline(kept.join('\n'), env)}</p>\n</blockquote>`);
+      blocks.push(kept.length === 0 ? '<blockquote>\n</blockquote>' : `<blockquote>\n<p>${inlineStr(kept.join('\n'), env)}</p>\n</blockquote>`);
       continue;
     }
-    const bullet = bulletMatch(line);
-    const ordered = bullet === null ? orderedMatch(line) : null;
+    const bullet = kind === K_BULLET ? bulletMatch(line) : null;
+    const ordered = bullet === null && kind === K_ORDERED ? orderedMatch(line) : null;
     if (bullet !== null || ordered !== null) {
       const isOrdered = ordered !== null;
       const start = isOrdered ? ordered.num : 1;
       const items = [];
       while (i < n) {
         if (isOrdered) {
-          const m = orderedMatch(lines[i]);
-          if (m !== null) { items.push([trimLine(m.content)]); i++; continue; }
+          if (kinds[i] === K_ORDERED) { const m = orderedMatch(lines[i]); items.push([trimLine(m.content)]); i++; continue; }
         } else {
-          const m = bulletMatch(lines[i]);
-          if (m !== null) { items.push([trimLine(m)]); i++; continue; }
+          if (kinds[i] === K_BULLET) { const m = bulletMatch(lines[i]); items.push([trimLine(m)]); i++; continue; }
         }
         if (items.length > 0 && isContinued(lines[i])) { items[items.length - 1].push(trimLine(lines[i])); i++; continue; }
         break;
@@ -597,18 +647,18 @@ function renderMarkdown(src, env) {
       const tag = isOrdered ? 'ol' : 'ul';
       const open = isOrdered && start !== 1 ? `<ol start="${start}">` : `<${tag}>`;
       const lis = [];
-      for (const parts of items) lis.push(`<li>${inline(parts.join('\n'), env)}</li>\n`);
+      for (const parts of items) lis.push(`<li>${inlineStr(parts.join('\n'), env)}</li>\n`);
       blocks.push(`${open}\n${lis.join('')}</${tag}>`);
       continue;
     }
     const body = [trimLine(line)];
     i++;
-    while (i < n && !endsParagraph(lines[i])) body.push(trimLine(lines[i++]));
-    const html = inline(body.join('\n'), env);
+    while (i < n && !endsKind(kinds[i])) body.push(trimLine(lines[i++]));
+    const html = inlineStr(body.join('\n'), env);
     if (excerpt === null) excerpt = html;
     blocks.push(`<p>${html}</p>`);
   }
-  return { html: blocks.length === 0 ? '' : blocks.map((b) => `${b}\n`).join(''), toc, excerpt: excerpt ?? '' };
+  return { html: blocks.length === 0 ? '' : `${blocks.join('\n')}\n`, toc, excerpt: excerpt ?? '' };
 }
 
 /* ---------------- templates ---------------- */
